@@ -350,7 +350,7 @@ class MainWindow(QtWidgets.QMainWindow):
         e.accept()
 
 # --------------------------
-# entry point  (TESTE 1234)14:56
+# entry point  KAUAI 14_59
 # --------------------------
 
 def main():
