@@ -350,7 +350,7 @@ class MainWindow(QtWidgets.QMainWindow):
         e.accept()
 
 # --------------------------
-# entry point  (TESTE 1234)aaaaaaaaaaaadad
+# entry point  (TESTE 1234)14:56
 # --------------------------
 
 def main():
