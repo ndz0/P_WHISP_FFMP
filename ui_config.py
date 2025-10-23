@@ -18,7 +18,7 @@ WINDOW_HEIGHT = 620
 USE_FUSION_STYLE = True
 
 # ---------- editable colors ----------
-COLOR_WINDOW_BG   = "#f4f4f4"  # main window background-
+COLOR_WINDOW_BG   = "#ff0000"  # main window background-
 COLOR_WINDOW_FG   = "#eeff00"  # main window text
 COLOR_BASE_BG     = "#ffffff"  # text areas / inputs base-
 COLOR_ALT_BG      = "#eaeaea"  # alternating rows background-
@@ -90,3 +90,6 @@ TIPS = [
 # helper: build work plan
 def build_steps():
     return [("dir", d) for d in DIRS] + [("file", f) for f in FILES]
+
+
+#ALTERACAO_DA_BASE_VERMELHA
