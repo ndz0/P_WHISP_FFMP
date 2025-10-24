@@ -1,0 +1,47 @@
+name: GPT context (no-API)
+
+on:
+  push:
+    branches: [ "**" ]  # roda em qualquer branch
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate context file
+        run: |
+          mkdir -p docs
+          BEFORE="${{ github.event.before || 'HEAD^' }}"
+          AFTER="${{ github.sha }}"
+          {
+            echo "# GPT Context — $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo
+            echo "**Repo:** ${{ github.repository }}  |  **Branch:** ${{ github.ref_name }}  |  **SHA:** $AFTER"
+            echo
+            echo "## Ultimos 20 commits"
+            git log --pretty=format:'- %h %ad %s (%an)' --date=short -n 20
+            echo
+            echo "## Arquivos alterados neste push"
+            git diff --name-status "$BEFORE" "$AFTER" || true
+            echo
+            echo "## Diff (trechos)"
+            git diff --unified=3 --no-color "$BEFORE" "$AFTER" | sed -n '1,2000p' || true
+            echo
+            echo "## Mapa do repo (top 200)"
+            git ls-files | head -n 200
+          } > docs/gpt-context.md
+
+      - name: Commit context
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/gpt-context.md
+          git commit -m "chore: update docs/gpt-context.md [skip ci]" || exit 0
+          git push

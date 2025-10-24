@@ -1,363 +1,290 @@
 # main.py
-# Qt GUI (PySide6) for creating the whisper-webui-beta tree with progress and verification
-# ASCII-only. No summary popups; no editors opened unless toolbar toggle is ON.
+# UI PySide6: convert to WAV (FFmpeg) and auto-transcribe with Whisper
+# No "Transcribe" button; UTF-8 end-to-end; reads final file to show accents correctly
+# ASCII-only
 
-import os, sys, time, subprocess
-from PySide6 import QtCore, QtGui, QtWidgets
-import ui_config as cfg
+from __future__ import annotations
+import sys
+from pathlib import Path
+from PySide6 import QtCore, QtWidgets, QtGui
 
-# --------------------------
-# Helpers (filesystem ops)
-# --------------------------
+import ffmpeg_upsert
+from whisper_upsert import run_whisper, build_args_transcribe
 
-def ensure_dir(full_path: str):
-    try:
-        os.makedirs(full_path, exist_ok=True)
-        return os.path.isdir(full_path), None
-    except Exception as e:
-        return False, str(e)
-
-def touch_file(full_path: str):
-    try:
-        os.makedirs(os.path.dirname(full_path), exist_ok=True)
-        is_new = not os.path.exists(full_path)
-        header = getattr(cfg, "TOUCH_HEADER", "# file created by setup script")
-        if is_new:
-            with open(full_path, "w", encoding="utf-8", newline="") as f:
-                f.write(header)
-        else:
-            with open(full_path, "a", encoding="utf-8", newline="") as f:
-                f.write("\n")
-        ok = os.path.isfile(full_path)
-        if ok and is_new:
-            with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
-                first = f.readline()
-            if "file created by setup script" not in first:
-                return False, "header check failed"
-        return ok, None
-    except Exception as e:
-        return False, str(e)
-
-def open_editors(root: str):
-    # Opens only the files listed in cfg.FILES (no .txt involved).
-    for rel in cfg.FILES:
-        full = os.path.join(root, rel)
-        try:
-            subprocess.Popen(["notepad.exe", full])
-        except Exception:
-            pass
-
-# --------------------------
-# Worker (QObject in QThread)
-# --------------------------
-
-class Worker(QtCore.QObject):
-    progress  = QtCore.Signal(int)                     # percent
-    row_result= QtCore.Signal(str, str, str, str)      # item, type, status, msg
-    log_line  = QtCore.Signal(str)                     # console line
-    finished  = QtCore.Signal(int, int)                # oks, fails
-
-    def __init__(self, root: str, open_editors_flag: bool, parent=None):
-        super().__init__(parent)
-        self.root = root
-        self.open_editors_flag = open_editors_flag
-        self.steps = cfg.build_steps()
-        self.total_steps = len(self.steps)
-        self._stop = False
-
-    @QtCore.Slot()
-    def run(self):
-        oks = 0
-        fails = 0
-        step_idx = 0
-
-        try:
-            os.makedirs(self.root, exist_ok=True)
-        except Exception:
-            pass
-
-        self._qlog(f"Start setup at ROOT: {self.root}")
-        for kind, rel in self.steps:
-            if self._stop:
-                break
-            step_idx += 1
-            pct = int((step_idx * 100) / self.total_steps)
-            full = os.path.join(self.root, rel)
-
-            if kind == "dir":
-                ok, err = ensure_dir(full)
-                status, typ = ("OK", "DIR") if ok else ("FAIL", "DIR")
-                msg = f"{status}: Create dir: {rel}"
-            else:
-                ok, err = touch_file(full)
-                status, typ = ("OK", "FILE") if ok else ("FAIL", "FILE")
-                msg = f"{status}: Create file: {rel}"
-
-            if not ok and err:
-                msg += f" (err: {err})"
-
-            self._qlog(f"[{pct:3d}%] {msg}")
-            self.row_result.emit(rel, typ, status, err or "")
-            self.progress.emit(pct)
-
-            if ok: oks += 1
-            else:  fails += 1
-
-            QtCore.QThread.msleep(50)
-
-        # only open editors if toolbar toggle is ON
-        if self.open_editors_flag:
-            self._qlog("Opening Notepad editors for created/verified files (toolbar toggle ON)...")
-            try:
-                open_editors(self.root)
-            except Exception as e:
-                self._qlog(f"Could not open editors: {e}")
-
-        self._qlog(f"Summary: Success={oks} Fails={fails} TotalSteps={self.total_steps}")
-        self.finished.emit(oks, fails)
-
-    def stop(self):
-        self._stop = True
-
-    def _qlog(self, msg: str):
-        ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        self.log_line.emit(f"[{ts}] {msg}")
-
-# --------------------------
-# Main Window
-# --------------------------
+BASE_DIR = Path(__file__).resolve().parent
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(cfg.WINDOW_TITLE)
-        self.resize(cfg.WINDOW_WIDTH, cfg.WINDOW_HEIGHT)
+        self.setWindowTitle("Whisper WAV Converter + Transcriber (Auto)")
+        self.resize(980, 620)
 
-        # toggles default state from config
-        self.confirm_on_close = bool(getattr(cfg, "CONFIRM_ON_CLOSE_DEFAULT", False))
-        self.open_editors_after_run = bool(getattr(cfg, "OPEN_EDITORS_DEFAULT", False))
-
-        # central widget
-        central = QtWidgets.QWidget(self)
-        self.setCentralWidget(central)
-        main_v = QtWidgets.QVBoxLayout(central)
-        main_v.setContentsMargins(10, 10, 10, 10)
-        main_v.setSpacing(8)
-
-        # ===== top configuration toolbar =====
-        self.toolbar = QtWidgets.QToolBar("Config")
+        # toolbar toggle
+        self.toolbar = self.addToolBar("Main")
         self.toolbar.setMovable(False)
-        self.addToolBar(QtCore.Qt.ToolBarArea.TopToolBarArea, self.toolbar)
+        self.act_confirm_exit = QtGui.QAction("Confirm exit?", self)
+        self.act_confirm_exit.setCheckable(True)
+        self.toolbar.addAction(self.act_confirm_exit)
 
-        # toggle: confirm on close
-        self.act_confirm = QtGui.QAction("Confirm on close", self)
-        self.act_confirm.setCheckable(True)
-        self.act_confirm.setChecked(self.confirm_on_close)
-        self.act_confirm.toggled.connect(self.on_toggle_confirm_close)
-        self.toolbar.addAction(self.act_confirm)
+        # status
+        self.status = self.statusBar()
 
-        # toggle: open editors after run
-        self.act_open_editors = QtGui.QAction("Open editors after run", self)
-        self.act_open_editors.setCheckable(True)
-        self.act_open_editors.setChecked(self.open_editors_after_run)
-        self.act_open_editors.toggled.connect(self.on_toggle_open_editors)
-        self.toolbar.addAction(self.act_open_editors)
+        # widgets
+        self.in_edit = QtWidgets.QLineEdit()
+        self.in_btn  = QtWidgets.QPushButton("Browse...")
+        self.out_edit = QtWidgets.QLineEdit()
+        self.out_btn  = QtWidgets.QPushButton("Browse...")
+        self.over_cb  = QtWidgets.QCheckBox("Overwrite (-y)")
+        self.over_cb.setChecked(True)
 
-        # top controls (root + browse)
-        top_box = QtWidgets.QHBoxLayout()
-        lbl_root = QtWidgets.QLabel("Root:")
-        self.ed_root = QtWidgets.QLineEdit(cfg.DEFAULT_ROOT)
-        self.btn_browse = QtWidgets.QPushButton("Browse...")
+        self.convert_btn = QtWidgets.QPushButton("Convert to WAV (mono 16k)")
 
-        top_box.addWidget(lbl_root)
-        top_box.addWidget(self.ed_root, 1)
-        top_box.addWidget(self.btn_browse)
+        # whisper controls (sem botao)
+        self.model_cb = QtWidgets.QComboBox()
+        self.model_cb.addItems(["tiny", "tiny.en", "base", "base.en", "small", "small.en", "medium", "large-v3"])
+        self.lang_edit = QtWidgets.QLineEdit()
+        self.lang_edit.setPlaceholderText("auto or ISO code (e.g. pt)")
+        self.format_cb = QtWidgets.QComboBox()
+        self.format_cb.addItems(["srt", "vtt", "txt", "json"])
 
-        # run + progress
-        run_box = QtWidgets.QHBoxLayout()
-        self.btn_run = QtWidgets.QPushButton("Run setup")
-        self.progress = QtWidgets.QProgressBar()
-        self.progress.setRange(0, 100)
-        self.lbl_pct = QtWidgets.QLabel("0%")
-        run_box.addWidget(self.btn_run)
-        run_box.addWidget(self.progress, 1)
-        run_box.addWidget(self.lbl_pct)
+        self.log_view = QtWidgets.QPlainTextEdit(); self.log_view.setReadOnly(True)
 
-        # splitter: table + log
-        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        # layout
+        form = QtWidgets.QFormLayout()
+        r1 = QtWidgets.QHBoxLayout(); r1.addWidget(self.in_edit, 1); r1.addWidget(self.in_btn)
+        r2 = QtWidgets.QHBoxLayout(); r2.addWidget(self.out_edit, 1); r2.addWidget(self.out_btn)
+        form.addRow("Input:", r1)
+        form.addRow("Output WAV:", r2)
 
-        # table
-        table_w = QtWidgets.QWidget()
-        table_l = QtWidgets.QVBoxLayout(table_w)
-        table_l.setContentsMargins(0, 0, 0, 0)
-        self.table = QtWidgets.QTableWidget(0, len(cfg.TABLE_HEADERS))
-        self.table.setHorizontalHeaderLabels(cfg.TABLE_HEADERS)
-        hh = self.table.horizontalHeader()
-        hh.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        hh.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        self.table.setAlternatingRowColors(True)
-        splitter.addWidget(table_w)
-        table_l.addWidget(self.table)
+        opts = QtWidgets.QHBoxLayout()
+        opts.addWidget(self.over_cb); opts.addStretch(1)
 
-        # log + tips
-        log_w = QtWidgets.QWidget()
-        log_l = QtWidgets.QVBoxLayout(log_w)
-        log_l.setContentsMargins(0, 0, 0, 0)
-        self.txt_log = QtWidgets.QPlainTextEdit()
-        self.txt_log.setReadOnly(True)
-        self.txt_log.setMaximumBlockCount(2000)
-        log_l.addWidget(self.txt_log)
+        whisper_row1 = QtWidgets.QHBoxLayout()
+        whisper_row1.addWidget(QtWidgets.QLabel("Model:")); whisper_row1.addWidget(self.model_cb)
+        whisper_row1.addWidget(QtWidgets.QLabel("Lang:"));  whisper_row1.addWidget(self.lang_edit)
+        whisper_row1.addWidget(QtWidgets.QLabel("Format:")); whisper_row1.addWidget(self.format_cb)
+        whisper_row1.addStretch(1)
 
-        tips = QtWidgets.QLabel("\n".join(cfg.TIPS))
-        tips.setStyleSheet(f"color:{cfg.COLOR_LINK_FG};")
-        log_l.addWidget(tips)
-        splitter.addWidget(log_w)
+        vbox = QtWidgets.QVBoxLayout()
+        vbox.addLayout(form)
+        vbox.addLayout(opts)
+        vbox.addWidget(self.convert_btn)
+        vbox.addSpacing(8)
+        vbox.addLayout(whisper_row1)
+        vbox.addWidget(self.log_view, 1)
 
-        # assemble
-        main_v.addLayout(top_box)
-        main_v.addLayout(run_box)
-        main_v.addWidget(splitter, 1)
+        central = QtWidgets.QWidget(); central.setLayout(vbox)
+        self.setCentralWidget(central)
 
         # connections
-        self.btn_browse.clicked.connect(self.on_browse)
-        self.btn_run.clicked.connect(self.on_run)
+        self.in_btn.clicked.connect(self.pick_input)
+        self.out_btn.clicked.connect(self.pick_output)
+        self.convert_btn.clicked.connect(self.on_convert_clicked)
 
-        self._thread = None
-        self._worker = None
+        self._ff_worker = None
+        self._whisper_worker = None
+        self._last_wav = None
+        self._last_fmt = None
 
-        # apply palette + stylesheet from config
-        self.apply_theme()
+        # ffmpeg status
+        try:
+            p = ffmpeg_upsert.ensure_ffmpeg()
+            self.status.showMessage(f"ffmpeg OK: {p}")
+        except Exception:
+            self.status.showMessage("ffmpeg not found. Run install_ffmpeg_portable.py")
 
-    # ---- theming ----
-    def apply_theme(self):
-        if cfg.USE_FUSION_STYLE:
-            QtWidgets.QApplication.setStyle("Fusion")
-        pal = QtGui.QPalette()
-        pal.setColor(QtGui.QPalette.ColorRole.Window,           QtGui.QColor(cfg.COLOR_WINDOW_BG))
-        pal.setColor(QtGui.QPalette.ColorRole.WindowText,       QtGui.QColor(cfg.COLOR_WINDOW_FG))
-        pal.setColor(QtGui.QPalette.ColorRole.Base,             QtGui.QColor(cfg.COLOR_BASE_BG))
-        pal.setColor(QtGui.QPalette.ColorRole.AlternateBase,    QtGui.QColor(cfg.COLOR_ALT_BG))
-        pal.setColor(QtGui.QPalette.ColorRole.Text,             QtGui.QColor(cfg.COLOR_TEXT_FG))
-        pal.setColor(QtGui.QPalette.ColorRole.Button,           QtGui.QColor(cfg.COLOR_BUTTON_BG))
-        pal.setColor(QtGui.QPalette.ColorRole.ButtonText,       QtGui.QColor(cfg.COLOR_BUTTON_FG))
-        pal.setColor(QtGui.QPalette.ColorRole.Highlight,        QtGui.QColor(cfg.COLOR_HILIGHT_BG))
-        pal.setColor(QtGui.QPalette.ColorRole.HighlightedText,  QtGui.QColor(cfg.COLOR_HILIGHT_FG))
-        self.window().setPalette(pal)
-        self.window().setStyleSheet(cfg.EXTRA_STYLESHEET)
+        # remember toggle
+        self.settings = QtCore.QSettings("P_WHISP_FFMP", "WAVConverter")
+        # QSettings.value may be typed as 'object' by type checkers, coerce to bool explicitly
+        self.act_confirm_exit.setChecked(bool(self.settings.value("confirm_exit", False, type=bool)))
+        self.act_confirm_exit.toggled.connect(lambda v: self.settings.setValue("confirm_exit", v))
 
-    # ---- toolbar toggles ----
-    def on_toggle_confirm_close(self, checked: bool):
-        self.confirm_on_close = bool(checked)
+    # helpers
+    def pick_input(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Choose input media", str(BASE_DIR), "Media files (*.*)")
+        if not path: return
+        self.in_edit.setText(path)
+        self.out_edit.setText(str(self._suggest_wav(Path(path))))
 
-    def on_toggle_open_editors(self, checked: bool):
-        self.open_editors_after_run = bool(checked)
+    def pick_output(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Choose output WAV", str(BASE_DIR / "output.wav"), "WAV (*.wav)")
+        if not path: return
+        if not path.lower().endswith(".wav"): path += ".wav"
+        self.out_edit.setText(path)
 
-    # ---- actions ----
-    def on_browse(self):
-        d = QtWidgets.QFileDialog.getExistingDirectory(self, "Select base directory", self.ed_root.text())
-        if d:
-            self.ed_root.setText(d)
+    def _suggest_wav(self, src: Path) -> Path:
+        return src.with_name(f"{src.stem}.wav")
 
-    def on_run(self):
-        if self._thread and self._thread.isRunning():
-            QtWidgets.QMessageBox.information(self, "Info", "Worker is already running.")
+    def _set_busy(self, busy: bool):
+        for w in (self.convert_btn, self.in_btn, self.out_btn, self.in_edit, self.out_edit,
+                  self.over_cb, self.model_cb, self.lang_edit, self.format_cb):
+            w.setEnabled(not busy)  # keep ascii logic simple
+        self.setCursor(QtCore.Qt.CursorShape.BusyCursor if busy else QtCore.Qt.CursorShape.ArrowCursor)
+
+    def _log(self, text: str):
+        self.log_view.appendPlainText(text)
+
+    # convert (FFmpeg)
+    def on_convert_clicked(self):
+        src = self.in_edit.text().strip()
+        dst = self.out_edit.text().strip()
+        if not src:
+            QtWidgets.QMessageBox.warning(self, "Warn", "Select an input file"); return
+        if not Path(src).exists():
+            QtWidgets.QMessageBox.critical(self, "Error", "Input file not found"); return
+        if not dst:
+            dst = str(self._suggest_wav(Path(src))); self.out_edit.setText(dst)
+
+        try:
+            p = ffmpeg_upsert.ensure_ffmpeg()
+            self._log(f"[ffmpeg] using: {p}")
+        except Exception:
+            QtWidgets.QMessageBox.critical(self, "FFmpeg missing", "ffmpeg not found.\nRun: python install_ffmpeg_portable.py")
             return
 
-        self.table.setRowCount(0)
-        self.progress.setValue(0)
-        self.lbl_pct.setText("0%")
+        args = []
+        if self.over_cb.isChecked(): args += ["-y"]
+        args += ["-i", src, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", dst]
 
-        root = self.ed_root.text().strip()
-        if not root:
-            QtWidgets.QMessageBox.warning(self, "Warning", "Root path is empty.")
-            return
-
-        self._thread = QtCore.QThread(self)
-        self._worker = Worker(root, self.open_editors_after_run)
-        self._worker.moveToThread(self._thread)
-
-        self._thread.started.connect(self._worker.run)
-        self._worker.progress.connect(self.on_progress)
-        self._worker.row_result.connect(self.on_row_result)
-        self._worker.log_line.connect(self.on_log_line)
-        self._worker.finished.connect(self.on_finished)
-        self._worker.finished.connect(self._thread.quit)
-        self._worker.finished.connect(self._worker.deleteLater)
-        self._thread.finished.connect(self._thread.deleteLater)
-
-        self.btn_run.setEnabled(False)
-        self._thread.start()
+        self._last_wav = dst
+        self.log_view.clear()
+        self._set_busy(True)
+        # Use internal FFmpeg thread wrapper instead of missing FFmpegWorker from ffmpeg_upsert
+        self._ff_worker = _FFmpegThread(args)
+        self._ff_worker.log.connect(self._log)
+        self._ff_worker.finished_with_code.connect(self._on_ffmpeg_finished)
+        self._ff_worker.start()
+        self.status.showMessage("Converting...")
 
     @QtCore.Slot(int)
-    def on_progress(self, pct: int):
-        self.progress.setValue(pct)
-        self.lbl_pct.setText(f"{pct}%")
+    def _on_ffmpeg_finished(self, code: int):
+        self._set_busy(False)
+        self.status.showMessage(f"FFmpeg done. Exit code: {code}")
+        if code != 0:
+            QtWidgets.QMessageBox.warning(self, "Warn", f"ffmpeg returned code {code}")
+            return
+        wav = self._last_wav
+        if not wav or not Path(wav).exists():
+            self._log("[auto] output WAV not found; skipping whisper")
+            return
+        self._log("-----")
+        self._log("[auto] starting Whisper transcription...")
+        self._start_whisper(wav)
 
-    @QtCore.Slot(str, str, str, str)
-    def on_row_result(self, item: str, typ: str, status: str, msg: str):
-        r = self.table.rowCount()
-        self.table.insertRow(r)
+    # whisper (auto)
+    def _start_whisper(self, wav_path: str):
+        model = self.model_cb.currentText().strip()
+        lang  = self.lang_edit.text().strip() or None
+        fmt   = self.format_cb.currentText().strip()
+        self._last_fmt = fmt
+        out_dir = str(Path(wav_path).resolve().parent)
 
-        def mk_item(text: str, bg: str, fg: str):
-            it = QtWidgets.QTableWidgetItem(text)
-            it.setBackground(QtGui.QColor(bg))
-            it.setForeground(QtGui.QColor(fg))
-            return it
+        args = build_args_transcribe(
+            input_path=wav_path,
+            model=model,
+            language=lang,
+            output_dir=out_dir,
+            output_format=fmt
+        )
 
-        if status == "OK":
-            bg, fg = cfg.COLOR_OK_BG, cfg.COLOR_OK_FG
-        elif status == "FAIL":
-            bg, fg = cfg.COLOR_FAIL_BG, cfg.COLOR_FAIL_FG
+        self._set_busy(True)
+        self._log(f"[whisper] model={model} lang={lang or 'auto'} format={fmt}")
+        self.status.showMessage("Transcribing...")
+
+        worker = _WhisperThread(args)
+        worker.log.connect(self._log)
+        worker.finished_with_code.connect(self._on_whisper_finished)
+        self._whisper_worker = worker
+        worker.start()
+
+    @QtCore.Slot(int)
+    def _on_whisper_finished(self, code: int):
+        self._set_busy(False)
+        self.status.showMessage(f"Whisper done. Exit code: {code}")
+        if code == 0:
+            # read final file in UTF-8 and append to log
+            try:
+                wav = self._last_wav or ""
+                fmt = self._last_fmt or "srt"
+                out_dir = Path(wav).resolve().parent if wav else BASE_DIR
+                out_file = out_dir / (Path(wav).stem + f".{fmt}")
+                if out_file.exists():
+                    with open(out_file, "r", encoding="utf-8", errors="replace") as f:
+                        self._log("-----")
+                        self._log(f"[result] {out_file.name}")
+                        self._log(f.read())
+                    QtWidgets.QMessageBox.information(self, "OK", f"Transcription completed: {out_file.name}")
+                else:
+                    QtWidgets.QMessageBox.information(self, "OK", "Transcription completed.")
+            except Exception as e:
+                self._log(f"[read-result][error] {e}")
         else:
-            bg, fg = cfg.COLOR_PENDING_BG, cfg.COLOR_PENDING_FG
+            QtWidgets.QMessageBox.warning(self, "Warn", f"whisper returned code {code}. If missing, run install_whisper_portable.py")
 
-        self.table.setItem(r, 0, mk_item(item, bg, fg))
-        self.table.setItem(r, 1, mk_item(typ, bg, fg))
-        self.table.setItem(r, 2, mk_item(status, bg, fg))
-        self.table.setItem(r, 3, mk_item(msg or "", bg, fg))
-        self.table.scrollToBottom()
-
-    @QtCore.Slot(str)
-    def on_log_line(self, line: str):
-        self.txt_log.appendPlainText(line)
-        self.txt_log.moveCursor(QtGui.QTextCursor.MoveOperation.End)
-
-    @QtCore.Slot(int, int)
-    def on_finished(self, oks: int, fails: int):
-        # no popups; just log a final line
-        total = len(cfg.build_steps())
-        line = f"Run finished. Success={oks} Fails={fails} Total={total}"
-        self.txt_log.appendPlainText(line)
-        self.txt_log.moveCursor(QtGui.QTextCursor.MoveOperation.End)
-        self.btn_run.setEnabled(True)
-
-    # close behavior controlled by toolbar toggle
-    def closeEvent(self, e: QtGui.QCloseEvent):
-        if self.confirm_on_close:
-            res = QtWidgets.QMessageBox.question(self, "Exit", "Close the window?")
-            if res != QtWidgets.QMessageBox.StandardButton.Yes:
-                e.ignore()
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        if self.act_confirm_exit.isChecked():
+            r = QtWidgets.QMessageBox.question(
+                self,
+                "Confirm",
+                "Close the app?",
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No
+            )
+            if r != QtWidgets.QMessageBox.StandardButton.Yes:
+                event.ignore()
                 return
-        # safe-stop worker if running
-        if hasattr(self, "_worker") and self._worker:
-            try: self._worker.stop()
-            except: pass
-        if self._thread and self._thread.isRunning():
-            self._thread.quit()
-            self._thread.wait(1500)
-        e.accept()
+        super().closeEvent(event)
+class _FFmpegThread(QtCore.QThread):
+    log = QtCore.Signal(str)
+    finished_with_code = QtCore.Signal(int)
+    def __init__(self, args: list[str]):
+        super().__init__()
+        self.args = args
+        self._exit = -1
+    def run(self):
+        import subprocess
+        try:
+            # ensure_ffmpeg() returns the ffmpeg binary path (str or Path)
+            ffbin = ffmpeg_upsert.ensure_ffmpeg()
+            cmd = [str(ffbin)] + list(self.args)
+            # spawn ffmpeg and emit its combined stdout/stderr lines to the UI
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            if proc.stdout is not None:
+                for line in proc.stdout:
+                    self.log.emit(line.rstrip())
+            proc.wait()
+            self._exit = proc.returncode
+        except Exception as e:
+            self.log.emit(f"[ffmpeg][error] {e}")
+            self._exit = -1
+        finally:
+            self.finished_with_code.emit(self._exit)
 
-# --------------------------
-# entry point  KAUAI 14_59
-# --------------------------
+class _WhisperThread(QtCore.QThread):
+    log = QtCore.Signal(str)
+    finished_with_code = QtCore.Signal(int)
+    def __init__(self, args: list[str]):
+        super().__init__()
+        self.args = args
+        self._exit = -1
+    def run(self):
+        def _emit(s: str): self.log.emit(s)
+        try:
+            code = run_whisper(self.args, on_log=_emit, prefer_python_module=True)
+            self._exit = code
+        except Exception as e:
+            self.log.emit(f"[whisper][error] {e}")
+            self._exit = -1
+        finally:
+            self.finished_with_code.emit(self._exit)
+            self.finished_with_code.emit(self._exit)
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
-    w = MainWindow()
-    w.show()
+    win = MainWindow()
+    win.show()
     sys.exit(app.exec())
 
 if __name__ == "__main__":
     main()
+
+#WHI_V3 - build 6

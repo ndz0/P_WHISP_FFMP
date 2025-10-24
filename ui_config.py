@@ -18,7 +18,7 @@ WINDOW_HEIGHT = 620
 USE_FUSION_STYLE = True
 
 # ---------- editable colors ----------
-COLOR_WINDOW_BG   = "#ff0000"  # main window background-
+COLOR_WINDOW_BG   = "#d3d3d3"  # main window background-
 COLOR_WINDOW_FG   = "#eeff00"  # main window text
 COLOR_BASE_BG     = "#ffffff"  # text areas / inputs base-
 COLOR_ALT_BG      = "#eaeaea"  # alternating rows background-
@@ -27,11 +27,11 @@ COLOR_BUTTON_BG   = "#6c6e70cc"  # push buttons
 COLOR_BUTTON_FG   = "#000000"  # push buttons text
 COLOR_HILIGHT_BG  = "#2563eb"  # selection highlight
 COLOR_HILIGHT_FG  = "#ffffff"  # selection text
-COLOR_LINK_FG     = "#8ab4f8"  # tips/links text
+COLOR_LINK_FG     = "#0062ff"  # tips/links text
 
 # table row colors
 COLOR_OK_BG       = "#b2ffd5"
-COLOR_OK_FG       = "#a8ffc8"
+COLOR_OK_FG       = "#000000"
 COLOR_FAIL_BG     = "#4a0e0e"
 COLOR_FAIL_FG     = "#ffd0d0"
 COLOR_PENDING_BG  = "#1f2630"
